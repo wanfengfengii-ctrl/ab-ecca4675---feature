@@ -55,9 +55,12 @@ class HttpCase(unittest.TestCase):
         conn.close()
         return resp.status, json.loads(raw) if raw else {}
 
-    def attestation_body(self, att_id, device, gen, prev, config, *, bad_sig=False, key_id=KEY_ID):
+    def attestation_body(self, att_id, device, gen, prev, config, *, bad_sig=False,
+                         key_id=KEY_ID, restores=None):
         doc = {"deviceId": device, "generation": gen, "previousGeneration": prev,
                "configSha256": h(config)}
+        if restores is not None:
+            doc["restoresGeneration"] = restores
         payload = json.dumps(doc, separators=(",", ":")).encode()
         sig = b"\x00" * 64 if bad_sig else ed25519.sign(payload, SEED)
         return {
@@ -136,6 +139,62 @@ class HttpCase(unittest.TestCase):
         s, r = self.req("POST", "/api/attestations", {"attestationId": "z"})
         self.assertEqual(s, 400)
         self.assertEqual(r["error"]["code"], "MALFORMED_REQUEST")
+
+    def test_restore_flow(self):
+        self.req("POST", "/api/attestations",
+                 self.attestation_body("rs-1", "sat-rs", 1, 0, b"v1"))
+        self.req("POST", "/api/attestations",
+                 self.attestation_body("rs-2", "sat-rs", 2, 1, b"v2"))
+
+        # emergency restore: new generation 3 replicating generation 1's config
+        s, r = self.req("POST", "/api/attestations",
+                        self.attestation_body("rs-3", "sat-rs", 3, 2, b"v1", restores=1))
+        self.assertEqual(s, 201, r)
+        self.assertEqual(r["status"], "accepted")
+        self.assertEqual(r["restoresGeneration"], 1)
+        self.assertEqual(r["configSha256"], h(b"v1"))
+
+        s, head = self.req("GET", "/api/devices/sat-rs/head")
+        self.assertEqual(s, 200)
+        self.assertEqual(head["generation"], 3)
+        self.assertEqual(head["restoresGeneration"], 1)
+        self.assertEqual(head["configSha256"], h(b"v1"))
+
+        # byte-identical retry of the restore replays the original outcome
+        s, r = self.req("POST", "/api/attestations",
+                        self.attestation_body("rs-3", "sat-rs", 3, 2, b"v1", restores=1))
+        self.assertEqual((s, r["status"]), (200, "duplicate"))
+        self.assertEqual(r["restoresGeneration"], 1)
+
+    def test_restore_conflict_codes(self):
+        self.req("POST", "/api/attestations",
+                 self.attestation_body("rc-1", "sat-rc", 1, 0, b"v1"))
+        self.req("POST", "/api/attestations",
+                 self.attestation_body("rc-2", "sat-rc", 2, 1, b"v2"))
+
+        # source generation was never accepted
+        s, r = self.req("POST", "/api/attestations",
+                        self.attestation_body("rc-3", "sat-rc", 3, 2, b"v1", restores=9))
+        self.assertEqual(s, 409)
+        self.assertEqual(r["error"]["code"], "RESTORE_SOURCE_NOT_FOUND")
+
+        # source is the current head, not an earlier generation
+        s, r = self.req("POST", "/api/attestations",
+                        self.attestation_body("rc-4", "sat-rc", 3, 2, b"v2", restores=2))
+        self.assertEqual(s, 409)
+        self.assertEqual(r["error"]["code"], "RESTORE_SOURCE_NOT_EARLIER")
+
+        # digest does not match the historical record for generation 1
+        s, r = self.req("POST", "/api/attestations",
+                        self.attestation_body("rc-5", "sat-rc", 3, 2, b"v2", restores=1))
+        self.assertEqual(s, 409)
+        self.assertEqual(r["error"]["code"], "RESTORE_CONFIG_MISMATCH")
+
+        # none of the conflicts advanced the head
+        s, head = self.req("GET", "/api/devices/sat-rc/head")
+        self.assertEqual(head["generation"], 2)
+        self.assertEqual(head["configSha256"], h(b"v2"))
+        self.assertNotIn("restoresGeneration", head)
 
     def test_unknown_route(self):
         s, _ = self.req("GET", "/nope")

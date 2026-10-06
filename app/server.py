@@ -100,17 +100,17 @@ class Handler(BaseHTTPRequestHandler):
             if head is None:
                 self._error(404, "DEVICE_NOT_FOUND", f"no accepted attestation for device {device_id!r}")
                 return
-            self._send_json(
-                200,
-                {
-                    "deviceId": head["deviceId"],
-                    "generation": head["generation"],
-                    "previousGeneration": head["previousGeneration"],
-                    "configSha256": head["configSha256"],
-                    "attestationId": head["attestationId"],
-                    "acceptedAt": head["acceptedAt"],
-                },
-            )
+            body = {
+                "deviceId": head["deviceId"],
+                "generation": head["generation"],
+                "previousGeneration": head["previousGeneration"],
+                "configSha256": head["configSha256"],
+                "attestationId": head["attestationId"],
+                "acceptedAt": head["acceptedAt"],
+            }
+            if head.get("restoresGeneration") is not None:
+                body["restoresGeneration"] = head["restoresGeneration"]
+            self._send_json(200, body)
             return
         self._error(404, "NOT_FOUND", "unknown path")
 
@@ -131,18 +131,18 @@ class Handler(BaseHTTPRequestHandler):
         )
         if decision.accepted:
             rec = decision.record or {}
-            self._send_json(
-                decision.status,
-                {
-                    "status": "duplicate" if decision.duplicate else "accepted",
-                    "deviceId": rec.get("deviceId"),
-                    "generation": rec.get("generation"),
-                    "previousGeneration": rec.get("previousGeneration"),
-                    "configSha256": rec.get("configSha256"),
-                    "attestationId": rec.get("attestationId"),
-                    "acceptedAt": rec.get("acceptedAt"),
-                },
-            )
+            body = {
+                "status": "duplicate" if decision.duplicate else "accepted",
+                "deviceId": rec.get("deviceId"),
+                "generation": rec.get("generation"),
+                "previousGeneration": rec.get("previousGeneration"),
+                "configSha256": rec.get("configSha256"),
+                "attestationId": rec.get("attestationId"),
+                "acceptedAt": rec.get("acceptedAt"),
+            }
+            if rec.get("restoresGeneration") is not None:
+                body["restoresGeneration"] = rec["restoresGeneration"]
+            self._send_json(decision.status, body)
         else:
             self._error(decision.status, decision.code, decision.message)
 

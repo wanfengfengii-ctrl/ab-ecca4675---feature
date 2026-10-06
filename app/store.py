@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS attestations (
     attestation_id    TEXT    NOT NULL,
     payload_sha256    TEXT    NOT NULL,
     accepted_at       TEXT    NOT NULL,
+    restores_generation INTEGER,
     PRIMARY KEY (device_id, generation),
     UNIQUE (attestation_id)
 );
@@ -39,6 +40,7 @@ class StoredAttestation:
         "attestation_id",
         "payload_sha256",
         "accepted_at",
+        "restores_generation",
     )
 
     def __init__(self, row: sqlite3.Row):
@@ -49,9 +51,10 @@ class StoredAttestation:
         self.attestation_id = row["attestation_id"]
         self.payload_sha256 = row["payload_sha256"]
         self.accepted_at = row["accepted_at"]
+        self.restores_generation = row["restores_generation"]
 
     def to_dict(self) -> dict:
-        return {
+        doc = {
             "deviceId": self.device_id,
             "generation": self.generation,
             "previousGeneration": self.previous_generation,
@@ -59,6 +62,11 @@ class StoredAttestation:
             "attestationId": self.attestation_id,
             "acceptedAt": self.accepted_at,
         }
+        # Only restore attestations carry the field; plain records keep the
+        # original response shape for backwards compatibility.
+        if self.restores_generation is not None:
+            doc["restoresGeneration"] = self.restores_generation
+        return doc
 
 
 class ConcurrentUpdateError(Exception):
@@ -74,7 +82,17 @@ class Store:
         self._busy_timeout = busy_timeout_ms
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.commit()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add columns introduced after the initial schema (idempotent)."""
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(attestations)")}
+        if "restores_generation" not in columns:
+            conn.execute(
+                "ALTER TABLE attestations ADD COLUMN restores_generation INTEGER"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -136,12 +154,13 @@ class Store:
         attestation_id: str,
         payload_sha256: str,
         accepted_at: str,
+        restores_generation: Optional[int] = None,
     ) -> None:
         conn.execute(
             "INSERT INTO attestations "
             "(device_id, generation, previous_generation, config_sha256, "
-            " attestation_id, payload_sha256, accepted_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " attestation_id, payload_sha256, accepted_at, restores_generation) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 device_id,
                 generation,
@@ -150,6 +169,7 @@ class Store:
                 attestation_id,
                 payload_sha256,
                 accepted_at,
+                restores_generation,
             ),
         )
 

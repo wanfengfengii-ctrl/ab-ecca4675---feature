@@ -1,7 +1,8 @@
 """Signature-admission smoke test run inside the one-shot ``verify`` service.
 
 It generates a fresh keypair, declares the public key, starts the real HTTP
-server on an ephemeral port, exercises accept/retry/reject paths, then restarts
+server on an ephemeral port, exercises accept/retry/reject paths plus the
+emergency-restore flow (valid restore, wrong-source rejections), then restarts
 a second server against the same database to prove head persistence.
 
 Exit code is non-zero (count of failures) if any check fails.
@@ -143,6 +144,84 @@ def main() -> int:
               status == 200 and body.get("generation") == 2
               and body.get("configSha256") == hashlib.sha256(config2).hexdigest(),
               f"{status} {body}")
+
+        # ---- emergency restore: roll forward to gen 3 replicating gen 1 ----
+        doc3 = {"deviceId": device, "generation": 3, "previousGeneration": 2,
+                "configSha256": hashlib.sha256(config1).hexdigest(),
+                "restoresGeneration": 1}
+        payload3 = json.dumps(doc3, separators=(",", ":")).encode()
+        env3 = {
+            "attestationId": "smoke-att-3",
+            "keyId": key_id,
+            "payloadBase64": base64.b64encode(payload3).decode(),
+            "signatureBase64": base64.b64encode(ed25519.sign(payload3, seed)).decode(),
+        }
+        status, body = request(port, "POST", "/api/attestations", env3)
+        check("restore accepted (201) with restoresGeneration",
+              status == 201 and body.get("restoresGeneration") == 1
+              and body.get("configSha256") == hashlib.sha256(config1).hexdigest(),
+              f"{status} {body}")
+
+        # identical retry of the restore replays the original outcome
+        status, body = request(port, "POST", "/api/attestations", env3)
+        check("restore retry is duplicate and keeps restoresGeneration",
+              status == 200 and body.get("status") == "duplicate"
+              and body.get("restoresGeneration") == 1, f"{status} {body}")
+
+        # restore source that was never accepted -> stable conflict, no change
+        doc_no_src = {"deviceId": device, "generation": 4, "previousGeneration": 3,
+                      "configSha256": hashlib.sha256(config1).hexdigest(),
+                      "restoresGeneration": 42}
+        p_no_src = json.dumps(doc_no_src, separators=(",", ":")).encode()
+        env_no_src = {
+            "attestationId": "smoke-att-no-src",
+            "keyId": key_id,
+            "payloadBase64": base64.b64encode(p_no_src).decode(),
+            "signatureBase64": base64.b64encode(ed25519.sign(p_no_src, seed)).decode(),
+        }
+        status, body = request(port, "POST", "/api/attestations", env_no_src)
+        check("restore with unknown source rejected",
+              status == 409 and body["error"]["code"] == "RESTORE_SOURCE_NOT_FOUND",
+              f"{status} {body}")
+
+        # digest does not match the historical record for generation 1
+        doc_mis = {"deviceId": device, "generation": 4, "previousGeneration": 3,
+                   "configSha256": hashlib.sha256(config2).hexdigest(),
+                   "restoresGeneration": 1}
+        p_mis = json.dumps(doc_mis, separators=(",", ":")).encode()
+        env_mis = {
+            "attestationId": "smoke-att-mismatch",
+            "keyId": key_id,
+            "payloadBase64": base64.b64encode(p_mis).decode(),
+            "signatureBase64": base64.b64encode(ed25519.sign(p_mis, seed)).decode(),
+        }
+        status, body = request(port, "POST", "/api/attestations", env_mis)
+        check("restore with mismatched digest rejected",
+              status == 409 and body["error"]["code"] == "RESTORE_CONFIG_MISMATCH",
+              f"{status} {body}")
+
+        # restoring the current head itself is not an earlier generation
+        doc_head = {"deviceId": device, "generation": 4, "previousGeneration": 3,
+                    "configSha256": hashlib.sha256(config1).hexdigest(),
+                    "restoresGeneration": 3}
+        p_head = json.dumps(doc_head, separators=(",", ":")).encode()
+        env_head = {
+            "attestationId": "smoke-att-head-src",
+            "keyId": key_id,
+            "payloadBase64": base64.b64encode(p_head).decode(),
+            "signatureBase64": base64.b64encode(ed25519.sign(p_head, seed)).decode(),
+        }
+        status, body = request(port, "POST", "/api/attestations", env_head)
+        check("restore of current head rejected",
+              status == 409 and body["error"]["code"] == "RESTORE_SOURCE_NOT_EARLIER",
+              f"{status} {body}")
+
+        status, body = request(port, "GET", f"/api/devices/{device}/head")
+        check("head is the restore generation with explicit source",
+              status == 200 and body.get("generation") == 3
+              and body.get("restoresGeneration") == 1
+              and body.get("configSha256") == hashlib.sha256(config1).hexdigest(),
+              f"{status} {body}")
     finally:
         server.shutdown()
         server.server_close()
@@ -155,10 +234,26 @@ def main() -> int:
     time.sleep(0.1)
     try:
         status, body = request(port2, "GET", f"/api/devices/{device}/head")
-        check("head survives restart",
-              status == 200 and body.get("generation") == 2
-              and body.get("configSha256") == hashlib.sha256(config2).hexdigest()
-              and body.get("attestationId") == "smoke-att-2",
+        check("head (incl. restore source) survives restart",
+              status == 200 and body.get("generation") == 3
+              and body.get("restoresGeneration") == 1
+              and body.get("configSha256") == hashlib.sha256(config1).hexdigest()
+              and body.get("attestationId") == "smoke-att-3",
+              f"{status} {body}")
+
+        # fork attempt against the pre-restore head is still rejected
+        doc_fork = {"deviceId": device, "generation": 9, "previousGeneration": 2,
+                    "configSha256": hashlib.sha256(b"fork").hexdigest()}
+        p_fork = json.dumps(doc_fork, separators=(",", ":")).encode()
+        env_fork = {
+            "attestationId": "smoke-att-fork",
+            "keyId": key_id,
+            "payloadBase64": base64.b64encode(p_fork).decode(),
+            "signatureBase64": base64.b64encode(ed25519.sign(p_fork, seed)).decode(),
+        }
+        status, body = request(port2, "POST", "/api/attestations", env_fork)
+        check("fork attempt after restart rejected",
+              status == 409 and body["error"]["code"] == "STALE_PREDECESSOR",
               f"{status} {body}")
 
         # unknown device
