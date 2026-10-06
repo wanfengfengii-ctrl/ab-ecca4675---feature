@@ -24,10 +24,20 @@ CREATE TABLE IF NOT EXISTS attestations (
     attestation_id    TEXT    NOT NULL,
     payload_sha256    TEXT    NOT NULL,
     accepted_at       TEXT    NOT NULL,
+    restores_generation INTEGER,
     PRIMARY KEY (device_id, generation),
     UNIQUE (attestation_id)
 );
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the initial schema to existing databases."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(attestations)")}
+    if "restores_generation" not in columns:
+        conn.execute(
+            "ALTER TABLE attestations ADD COLUMN restores_generation INTEGER"
+        )
 
 
 class StoredAttestation:
@@ -39,6 +49,7 @@ class StoredAttestation:
         "attestation_id",
         "payload_sha256",
         "accepted_at",
+        "restores_generation",
     )
 
     def __init__(self, row: sqlite3.Row):
@@ -49,6 +60,7 @@ class StoredAttestation:
         self.attestation_id = row["attestation_id"]
         self.payload_sha256 = row["payload_sha256"]
         self.accepted_at = row["accepted_at"]
+        self.restores_generation = row["restores_generation"]
 
     def to_dict(self) -> dict:
         return {
@@ -58,6 +70,7 @@ class StoredAttestation:
             "configSha256": self.config_sha256,
             "attestationId": self.attestation_id,
             "acceptedAt": self.accepted_at,
+            "restoresGeneration": self.restores_generation,
         }
 
 
@@ -74,6 +87,7 @@ class Store:
         self._busy_timeout = busy_timeout_ms
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            _migrate(conn)
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -136,12 +150,13 @@ class Store:
         attestation_id: str,
         payload_sha256: str,
         accepted_at: str,
+        restores_generation: Optional[int] = None,
     ) -> None:
         conn.execute(
             "INSERT INTO attestations "
             "(device_id, generation, previous_generation, config_sha256, "
-            " attestation_id, payload_sha256, accepted_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " attestation_id, payload_sha256, accepted_at, restores_generation) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 device_id,
                 generation,
@@ -150,6 +165,7 @@ class Store:
                 attestation_id,
                 payload_sha256,
                 accepted_at,
+                restores_generation,
             ),
         )
 

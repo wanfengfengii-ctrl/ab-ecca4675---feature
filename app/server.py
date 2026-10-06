@@ -109,6 +109,7 @@ class Handler(BaseHTTPRequestHandler):
                     "configSha256": head["configSha256"],
                     "attestationId": head["attestationId"],
                     "acceptedAt": head["acceptedAt"],
+                    "restoresGeneration": head["restoresGeneration"],
                 },
             )
             return
@@ -141,6 +142,7 @@ class Handler(BaseHTTPRequestHandler):
                     "configSha256": rec.get("configSha256"),
                     "attestationId": rec.get("attestationId"),
                     "acceptedAt": rec.get("acceptedAt"),
+                    "restoresGeneration": rec.get("restoresGeneration"),
                 },
             )
         else:

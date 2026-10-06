@@ -1,7 +1,8 @@
 """Signature-admission smoke test run inside the one-shot ``verify`` service.
 
 It generates a fresh keypair, declares the public key, starts the real HTTP
-server on an ephemeral port, exercises accept/retry/reject paths, then restarts
+server on an ephemeral port, exercises accept/retry/reject paths plus the
+emergency-restore flow (valid restore, wrong-source rejections), then restarts
 a second server against the same database to prove head persistence.
 
 Exit code is non-zero (count of failures) if any check fails.
@@ -143,6 +144,88 @@ def main() -> int:
               status == 200 and body.get("generation") == 2
               and body.get("configSha256") == hashlib.sha256(config2).hexdigest(),
               f"{status} {body}")
+
+        # jump to generation 5, leaving 3 and 4 never accepted
+        config3 = b"smoke-config-v3"
+        doc5 = {"deviceId": device, "generation": 5, "previousGeneration": 2,
+                "configSha256": hashlib.sha256(config3).hexdigest()}
+        payload5 = json.dumps(doc5, separators=(",", ":")).encode()
+        env5 = {
+            "attestationId": "smoke-att-5",
+            "keyId": key_id,
+            "payloadBase64": base64.b64encode(payload5).decode(),
+            "signatureBase64": base64.b64encode(ed25519.sign(payload5, seed)).decode(),
+        }
+        status, body = request(port, "POST", "/api/attestations", env5)
+        check("gapped successor accepted (201)", status == 201, f"{status} {body}")
+
+        # ---- restore flow ------------------------------------------------
+        # emergency restore of the generation-1 config, chained as gen 6
+        doc6 = {"deviceId": device, "generation": 6, "previousGeneration": 5,
+                "configSha256": hashlib.sha256(config1).hexdigest(),
+                "restoresGeneration": 1}
+        payload6 = json.dumps(doc6, separators=(",", ":")).encode()
+        env6 = {
+            "attestationId": "smoke-att-6",
+            "keyId": key_id,
+            "payloadBase64": base64.b64encode(payload6).decode(),
+            "signatureBase64": base64.b64encode(ed25519.sign(payload6, seed)).decode(),
+        }
+        status, body = request(port, "POST", "/api/attestations", env6)
+        check("restore accepted (201) with source",
+              status == 201 and body.get("restoresGeneration") == 1, f"{status} {body}")
+
+        # identical retry of the restore -> duplicate, same source, no new state
+        status, body = request(port, "POST", "/api/attestations", env6)
+        check("restore retry is duplicate with source",
+              status == 200 and body.get("status") == "duplicate"
+              and body.get("restoresGeneration") == 1, f"{status} {body}")
+
+        status, body = request(port, "GET", f"/api/devices/{device}/head")
+        check("head reports restore source",
+              status == 200 and body.get("generation") == 6
+              and body.get("restoresGeneration") == 1
+              and body.get("configSha256") == hashlib.sha256(config1).hexdigest(),
+              f"{status} {body}")
+
+        # wrong restore sources are rejected with stable codes, state untouched
+        def restore_env(att_id, restores, config, gen=7, prev=6):
+            doc = {"deviceId": device, "generation": gen, "previousGeneration": prev,
+                   "configSha256": hashlib.sha256(config).hexdigest(),
+                   "restoresGeneration": restores}
+            p = json.dumps(doc, separators=(",", ":")).encode()
+            return {
+                "attestationId": att_id,
+                "keyId": key_id,
+                "payloadBase64": base64.b64encode(p).decode(),
+                "signatureBase64": base64.b64encode(ed25519.sign(p, seed)).decode(),
+            }
+
+        # generation 4 is behind the head but was never accepted
+        status, body = request(port, "POST", "/api/attestations",
+                               restore_env("smoke-att-bad1", 4, config1))
+        check("restore of unknown generation rejected",
+              status == 409 and body["error"]["code"] == "RESTORE_TARGET_NOT_FOUND",
+              f"{status} {body}")
+
+        # the current head itself is not an earlier generation
+        status, body = request(port, "POST", "/api/attestations",
+                               restore_env("smoke-att-bad2", 6, config1))
+        check("restore of non-earlier generation rejected",
+              status == 409 and body["error"]["code"] == "RESTORE_TARGET_NOT_EARLIER",
+              f"{status} {body}")
+
+        # gen 2 recorded config2's digest, not config1's
+        status, body = request(port, "POST", "/api/attestations",
+                               restore_env("smoke-att-bad3", 2, config1))
+        check("restore with mismatched digest rejected",
+              status == 409 and body["error"]["code"] == "RESTORE_CONFIG_MISMATCH",
+              f"{status} {body}")
+
+        status, body = request(port, "GET", f"/api/devices/{device}/head")
+        check("rejections left head at generation 6",
+              status == 200 and body.get("generation") == 6
+              and body.get("restoresGeneration") == 1, f"{status} {body}")
     finally:
         server.shutdown()
         server.server_close()
@@ -155,11 +238,18 @@ def main() -> int:
     time.sleep(0.1)
     try:
         status, body = request(port2, "GET", f"/api/devices/{device}/head")
-        check("head survives restart",
-              status == 200 and body.get("generation") == 2
-              and body.get("configSha256") == hashlib.sha256(config2).hexdigest()
-              and body.get("attestationId") == "smoke-att-2",
+        check("head (with restore source) survives restart",
+              status == 200 and body.get("generation") == 6
+              and body.get("restoresGeneration") == 1
+              and body.get("configSha256") == hashlib.sha256(config1).hexdigest()
+              and body.get("attestationId") == "smoke-att-6",
               f"{status} {body}")
+
+        # retrying the restore after the restart replays the same outcome
+        status, body = request(port2, "POST", "/api/attestations", env6)
+        check("restore retry after restart is duplicate",
+              status == 200 and body.get("status") == "duplicate"
+              and body.get("restoresGeneration") == 1, f"{status} {body}")
 
         # unknown device
         status, body = request(port2, "GET", "/api/devices/unknown/head")

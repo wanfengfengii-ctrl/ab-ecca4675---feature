@@ -36,6 +36,34 @@
 
 `configSha256` 必须是 **64 位小写十六进制**的配置 SHA-256。
 
+### 紧急恢复（可选字段 `restoresGeneration`）
+
+新配置在轨引发异常时，载荷团队可以签发**恢复证明**重新启用某个已接纳配置，
+同时让证明代次继续单调前进（恢复不是普通回退，不会复用旧代次）。在载荷中
+增加可选字段：
+
+```json
+{
+  "deviceId": "sat-alpha",
+  "generation": 3,
+  "previousGeneration": 2,
+  "configSha256": "<第 1 代已接纳配置的 SHA-256>",
+  "restoresGeneration": 1
+}
+```
+
+恢复证明仍须由设备密钥签署，且必须满足：
+
+1. 照常承接当前头：`previousGeneration == 当前头 generation`，`generation` 严格更大；
+2. `restoresGeneration` 指向**同设备当前头之前已接纳**的一代（严格小于当前头）；
+3. `configSha256` 与该历史代次记录的摘要**完全一致**。
+
+历史代次不存在、并非更早版本、或摘要与历史记录不符时，返回 `409` 稳定冲突码
+（见下表），设备状态保持不变。未携带 `restoresGeneration` 时，上述普通接纳契约
+完全不变。恢复被接纳后，响应与 `GET /api/devices/{deviceId}/head` 都会返回
+`restoresGeneration`（普通证明为 `null`），相同编号重试与服务重启后的查询结果
+保持一致。
+
 接纳规则：
 
 1. 用 `keyId` 对应的部署公钥验证签名；未知密钥 / 错误签名一律拒绝，且**不改变状态**。
@@ -55,13 +83,15 @@
   "previousGeneration": 1,
   "configSha256": "...",
   "attestationId": "...",
-  "acceptedAt": "2026-10-06T16:34:16Z"
+  "acceptedAt": "2026-10-06T16:34:16Z",
+  "restoresGeneration": null
 }
 ```
 
 ### `GET /api/devices/{deviceId}/head`
 
-返回设备当前**唯一**已接纳代次与配置摘要；服务重启后结果不变。未知设备返回 `404 DEVICE_NOT_FOUND`。
+返回设备当前**唯一**已接纳代次、配置摘要与恢复来源（`restoresGeneration`，
+普通证明为 `null`）；服务重启后结果不变。未知设备返回 `404 DEVICE_NOT_FOUND`。
 
 ### 稳定错误码
 
@@ -79,6 +109,9 @@
 | 409 | `STALE_PREDECESSOR` | 前代不等于当前头（过期/回退/重放） |
 | 409 | `ATTESTATION_ID_CONTENT_MISMATCH` | 编号复用但签名内容不同 |
 | 409 | `GENERATION_CONTENT_CONFLICT` | 同代次已接纳不同内容 |
+| 409 | `RESTORE_TARGET_NOT_FOUND` | 恢复目标代次未曾被该设备接纳 |
+| 409 | `RESTORE_TARGET_NOT_EARLIER` | 恢复目标不在当前头之前（≥ 当前头） |
+| 409 | `RESTORE_CONFIG_MISMATCH` | 载荷摘要与恢复目标的历史摘要不符 |
 | 409 | `CONCURRENT_UPDATE` | 并发竞争失败（请重新读取 head 后重试） |
 
 所有冲突/鉴权失败都不会推进设备状态。
@@ -136,7 +169,7 @@ docker compose run --build --rm verify
 # 全部通过 -> 退出码 0；任一失败 -> 退出码非 0
 ```
 
-冒烟在容器内自起一个临时 HTTP 服务，覆盖：健康检查、首次接纳、幂等重试、错误签名/未知密钥拒绝、后继承接、过期前代冲突、以及**重启同一数据库后 head 仍唯一且分叉尝试被拒**。
+冒烟在容器内自起一个临时 HTTP 服务，覆盖：健康检查、首次接纳、幂等重试、错误签名/未知密钥拒绝、后继承接、过期前代冲突、**有效恢复（响应与 head 均携带恢复来源）、三类错误恢复来源拒绝（目标不存在 / 非更早版本 / 摘要不符）且状态不变**，以及**重启同一数据库后 head 仍唯一、恢复来源可查、分叉尝试被拒**。
 
 ## 测试
 

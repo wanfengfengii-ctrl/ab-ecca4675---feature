@@ -141,6 +141,195 @@ class Case(unittest.TestCase):
         d2, _, _ = self.submit("a2", "dev", 25, 10, b"cfg-2")
         self.assertTrue(d2.accepted)
 
+    # ---------------------------------------------------------------- restore
+    def test_plain_attestation_reports_null_restore(self):
+        d, _, _ = self.submit("a1", "dev", 1, 0, b"cfg-1")
+        self.assertTrue(d.accepted)
+        self.assertIsNone(d.record["restoresGeneration"])
+        self.assertIsNone(self.admitter.head("dev")["restoresGeneration"])
+
+    def test_restore_accepted_and_reported(self):
+        self.submit("a1", "dev", 1, 0, b"cfg-1")
+        self.submit("a2", "dev", 2, 1, b"cfg-2")
+        # emergency restore of the generation-1 config, still moving forward
+        d, _, _ = self.submit("a3", "dev", 3, 2, b"cfg-1",
+                              extra={"restoresGeneration": 1})
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.status, 201)
+        self.assertEqual(d.record["restoresGeneration"], 1)
+        self.assertEqual(d.record["generation"], 3)
+        head = self.admitter.head("dev")
+        self.assertEqual(head["generation"], 3)
+        self.assertEqual(head["configSha256"], digest(b"cfg-1"))
+        self.assertEqual(head["restoresGeneration"], 1)
+
+    def test_restore_can_target_a_restore(self):
+        self.submit("a1", "dev", 1, 0, b"cfg-1")
+        self.submit("a2", "dev", 2, 1, b"cfg-2")
+        self.submit("a3", "dev", 3, 2, b"cfg-1", extra={"restoresGeneration": 1})
+        self.submit("a4", "dev", 4, 3, b"cfg-4")
+        # generation 3 is itself a restore; restoring it again is fine
+        d, _, _ = self.submit("a5", "dev", 5, 4, b"cfg-1",
+                              extra={"restoresGeneration": 3})
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.record["restoresGeneration"], 3)
+
+    def test_restore_target_must_exist(self):
+        self.submit("a1", "dev", 1, 0, b"cfg-1")
+        self.submit("a2", "dev", 5, 1, b"cfg-5")  # gap: 2..4 never accepted
+        # generation 3 is behind the head but was never accepted
+        d, _, _ = self.submit("a3", "dev", 6, 5, b"cfg-1",
+                              extra={"restoresGeneration": 3})
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.code, "RESTORE_TARGET_NOT_FOUND")
+        self.assertEqual(d.status, 409)
+        self.assertEqual(self.admitter.head("dev")["generation"], 5)
+
+    def test_restore_without_any_history_rejected(self):
+        d, _, _ = self.submit("a1", "dev", 1, 0, b"cfg-1",
+                              extra={"restoresGeneration": 0})
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.code, "RESTORE_TARGET_NOT_FOUND")
+        self.assertIsNone(self.admitter.head("dev"))
+
+    def test_restore_target_must_be_earlier_than_head(self):
+        self.submit("a1", "dev", 1, 0, b"cfg-1")
+        self.submit("a2", "dev", 2, 1, b"cfg-2")
+        # equal to the current head is not "an earlier generation"
+        d, _, _ = self.submit("a3", "dev", 3, 2, b"cfg-2",
+                              extra={"restoresGeneration": 2})
+        self.assertEqual(d.code, "RESTORE_TARGET_NOT_EARLIER")
+        # ahead of the head (also not accepted anywhere)
+        d2, _, _ = self.submit("a4", "dev", 3, 2, b"cfg-2",
+                               extra={"restoresGeneration": 9})
+        self.assertEqual(d2.code, "RESTORE_TARGET_NOT_EARLIER")
+        self.assertEqual(self.admitter.head("dev")["generation"], 2)
+
+    def test_restore_digest_must_match_history(self):
+        self.submit("a1", "dev", 1, 0, b"cfg-1")
+        self.submit("a2", "dev", 2, 1, b"cfg-2")
+        # generation 1 accepted cfg-1, not cfg-OTHER
+        d, _, _ = self.submit("a3", "dev", 3, 2, b"cfg-OTHER",
+                              extra={"restoresGeneration": 1})
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.code, "RESTORE_CONFIG_MISMATCH")
+        self.assertEqual(d.status, 409)
+        head = self.admitter.head("dev")
+        self.assertEqual(head["generation"], 2)
+        self.assertIsNone(head["restoresGeneration"])
+
+    def test_restore_still_chains_head(self):
+        self.submit("a1", "dev", 1, 0, b"cfg-1")
+        self.submit("a2", "dev", 2, 1, b"cfg-2")
+        # a restore does not exempt the attestation from the chain rules
+        d, _, _ = self.submit("a3", "dev", 3, 1, b"cfg-1",
+                              extra={"restoresGeneration": 1})
+        self.assertEqual(d.code, "STALE_PREDECESSOR")
+        self.assertEqual(self.admitter.head("dev")["generation"], 2)
+
+    def test_restore_still_requires_forward_generation(self):
+        self.submit("a1", "dev", 1, 0, b"cfg-1")
+        self.submit("a2", "dev", 5, 1, b"cfg-5")  # gap: head is 5
+        d, _, _ = self.submit("a3", "dev", 3, 5, b"cfg-1",
+                              extra={"restoresGeneration": 1})
+        self.assertEqual(d.code, "GENERATION_NOT_GREATER")
+
+    def test_restore_retry_is_duplicate_with_source(self):
+        self.submit("a1", "dev", 1, 0, b"cfg-1")
+        self.submit("a2", "dev", 2, 1, b"cfg-2")
+        d1, payload, sig = self.submit("a3", "dev", 3, 2, b"cfg-1",
+                                       extra={"restoresGeneration": 1})
+        self.assertEqual(d1.status, 201)
+        # byte-identical retry replays the original outcome, source included
+        r = self.admitter.admit(
+            attestation_id="a3",
+            key_id=KEY_ID,
+            payload_b64=base64.b64encode(payload).decode(),
+            signature_b64=base64.b64encode(sig).decode(),
+        )
+        self.assertTrue(r.accepted)
+        self.assertEqual(r.status, 200)
+        self.assertTrue(r.duplicate)
+        self.assertEqual(r.record["restoresGeneration"], 1)
+        self.assertEqual(self.store.accepted_generations("dev"), [1, 2, 3])
+
+    def test_restore_survives_reopen(self):
+        self.submit("a1", "dev", 1, 0, b"cfg-1")
+        self.submit("a2", "dev", 2, 1, b"cfg-2")
+        self.submit("a3", "dev", 3, 2, b"cfg-1", extra={"restoresGeneration": 1})
+        store2 = Store(self.db)
+        adm2 = Admitter(store2, {KEY_ID: PUB}, {KEY_ID: None})
+        head = adm2.head("dev")
+        self.assertEqual(head["generation"], 3)
+        self.assertEqual(head["restoresGeneration"], 1)
+        self.assertEqual(head["configSha256"], digest(b"cfg-1"))
+
+    def test_restore_payload_field_validation(self):
+        # bool must not be accepted as an integer
+        d, _, _ = self.submit("a1", "dev", 1, 0, b"c",
+                              extra={"restoresGeneration": True})
+        self.assertEqual(d.code, "INVALID_JSON_PAYLOAD")
+        d2, _, _ = self.submit("a2", "dev", 1, 0, b"c",
+                               extra={"restoresGeneration": "1"})
+        self.assertEqual(d2.code, "INVALID_JSON_PAYLOAD")
+        d3, _, _ = self.submit("a3", "dev", 1, 0, b"c",
+                               extra={"restoresGeneration": -1})
+        self.assertEqual(d3.code, "INVALID_JSON_PAYLOAD")
+        self.assertIsNone(self.admitter.head("dev"))
+
+    def test_legacy_database_is_migrated(self):
+        import sqlite3
+
+        legacy_db = os.path.join(self.tmp.name, "legacy.db")
+        conn = sqlite3.connect(legacy_db)
+        conn.execute(
+            "CREATE TABLE attestations ("
+            " device_id TEXT NOT NULL, generation INTEGER NOT NULL,"
+            " previous_generation INTEGER NOT NULL, config_sha256 TEXT NOT NULL,"
+            " attestation_id TEXT NOT NULL, payload_sha256 TEXT NOT NULL,"
+            " accepted_at TEXT NOT NULL,"
+            " PRIMARY KEY (device_id, generation), UNIQUE (attestation_id))"
+        )
+        conn.execute(
+            "INSERT INTO attestations VALUES ('dev', 1, 0, ?, 'a1', ?, ?)",
+            (digest(b"cfg-1"), digest(b"payload-1"), "2026-01-01T00:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO attestations VALUES ('dev', 2, 1, ?, 'a2', ?, ?)",
+            (digest(b"cfg-2"), digest(b"payload-2"), "2026-01-02T00:00:00Z"),
+        )
+        conn.commit()
+        conn.close()
+
+        store = Store(legacy_db)  # migrates the old schema in place
+        adm = Admitter(store, {KEY_ID: PUB}, {KEY_ID: None})
+        head = adm.head("dev")
+        self.assertEqual(head["generation"], 2)
+        self.assertIsNone(head["restoresGeneration"])
+        # a restore may target a generation accepted before the migration
+        d, _, _ = self._submit_to(adm, "a3", "dev", 3, 2, b"cfg-1",
+                                  extra={"restoresGeneration": 1})
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.record["restoresGeneration"], 1)
+
+    def _submit_to(self, admitter, att_id, device, gen, prev, config, *, extra=None):
+        doc = {
+            "deviceId": device,
+            "generation": gen,
+            "previousGeneration": prev,
+            "configSha256": digest(config),
+        }
+        if extra:
+            doc.update(extra)
+        payload = json.dumps(doc, separators=(",", ":")).encode("utf-8")
+        sig = ed25519.sign(payload, SEED)
+        return admitter.admit(
+            attestation_id=att_id,
+            key_id=KEY_ID,
+            payload_b64=base64.b64encode(payload).decode(),
+            signature_b64=base64.b64encode(sig).decode(),
+        ), payload, sig
+
     def test_unknown_key(self):
         d, _, _ = self.submit("a1", "dev", 1, 0, b"cfg-1", key_id="nope", seed=SEED)
         self.assertFalse(d.accepted)
@@ -253,6 +442,41 @@ class Case(unittest.TestCase):
         self.assertEqual(len(accepted_201), 1, results)
         self.assertTrue(all(r[1] for r in results), results)
         self.assertEqual(len(self.store.accepted_generations("dev")), 1)
+
+    def test_concurrent_successor_vs_restore_single_winner(self):
+        self.submit("root", "dev", 1, 0, b"cfg-1")
+        self.submit("g2", "dev", 2, 1, b"cfg-2")
+        results = []
+
+        def plain_successor():
+            d, _, _ = self.submit("plain-3", "dev", 3, 2, b"cfg-3")
+            results.append(("plain", d.accepted, d.code))
+
+        def restore():
+            d, _, _ = self.submit("restore-3", "dev", 3, 2, b"cfg-1",
+                                  extra={"restoresGeneration": 1})
+            results.append(("restore", d.accepted, d.code))
+
+        threads = [threading.Thread(target=plain_successor),
+                   threading.Thread(target=restore)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # exactly one attestation chains onto the old head
+        wins = [r for r in results if r[1]]
+        self.assertEqual(len(wins), 1, results)
+        self.assertEqual(self.store.accepted_generations("dev"), [1, 2, 3])
+        head = self.admitter.head("dev")
+        self.assertEqual(head["generation"], 3)
+        if wins[0][0] == "restore":
+            # the unique new generation exposes its restore source
+            self.assertEqual(head["restoresGeneration"], 1)
+            self.assertEqual(head["configSha256"], digest(b"cfg-1"))
+        else:
+            self.assertIsNone(head["restoresGeneration"])
+            self.assertEqual(head["configSha256"], digest(b"cfg-3"))
 
 
 def _multiprocess_worker(db_path, att_id, config_byte):

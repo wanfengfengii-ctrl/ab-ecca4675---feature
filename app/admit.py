@@ -10,6 +10,21 @@ generations:
 * every later attestation MUST carry ``previousGeneration`` equal to the
   currently accepted generation and a ``generation`` strictly greater than it.
 
+Restore attestations
+--------------------
+A payload MAY carry ``restoresGeneration`` to perform an emergency restore of a
+previously accepted configuration (e.g. a satellite payload team rolling back
+to a known-good config after an anomaly). A restore is NOT a plain rollback:
+it still chains onto the current head with a strictly greater ``generation``,
+so the proof lineage keeps moving monotonically forward. Additionally:
+
+* ``restoresGeneration`` MUST name a generation that was accepted for the same
+  device strictly before the current head;
+* ``configSha256`` MUST equal the digest recorded at that historical
+  generation.
+
+Violations are stable 409 conflicts and leave state untouched.
+
 Retries (same attestation id byte-for-byte) replay the original outcome and
 never mutate state. A reused id with different content, a stale predecessor,
 or a generation that does not advance is a conflict and leaves state untouched.
@@ -43,6 +58,9 @@ ERR_BAD_PREDECESSOR_FIRST = "FIRST_PREDECESSOR_NOT_ZERO"
 ERR_STALE_PREDECESSOR = "STALE_PREDECESSOR"
 ERR_ID_CONTENT_MISMATCH = "ATTESTATION_ID_CONTENT_MISMATCH"
 ERR_GENERATION_CONTENT_MISMATCH = "GENERATION_CONTENT_CONFLICT"
+ERR_RESTORE_TARGET_NOT_FOUND = "RESTORE_TARGET_NOT_FOUND"
+ERR_RESTORE_TARGET_NOT_EARLIER = "RESTORE_TARGET_NOT_EARLIER"
+ERR_RESTORE_CONFIG_MISMATCH = "RESTORE_CONFIG_MISMATCH"
 ERR_RACE_LOST = "CONCURRENT_UPDATE"
 ERR_INTERNAL = "INTERNAL_ERROR"
 
@@ -106,6 +124,13 @@ def validate_payload(raw: bytes) -> dict:
         raise ValueError("payload field configSha256 must be a non-empty string")
     if not _HEX64.fullmatch(doc["configSha256"]):
         raise ValueError("payload field configSha256 must be 64 lowercase hex characters")
+    # Optional restore marker: a non-negative integer generation number.
+    if "restoresGeneration" in doc:
+        value = doc["restoresGeneration"]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("payload field restoresGeneration must be an integer")
+        if value < 0:
+            raise ValueError("payload field restoresGeneration must be non-negative")
     return doc
 
 
@@ -185,6 +210,7 @@ class Admitter:
             generation=doc["generation"],
             previous_generation=doc["previousGeneration"],
             config_sha256=doc["configSha256"],
+            restores_generation=doc.get("restoresGeneration"),
         )
 
     def _persist(
@@ -196,6 +222,7 @@ class Admitter:
         generation: int,
         previous_generation: int,
         config_sha256: str,
+        restores_generation: Optional[int],
     ) -> AdmissionDecision:
         from .store import ConcurrentUpdateError
 
@@ -260,6 +287,39 @@ class Admitter:
                             f"current head {head.generation}",
                         )
 
+                # 5) Restore semantics, checked against the locked head and
+                #    history. A restore still chains onto the head (enforced
+                #    above); here the restore SOURCE must be an accepted
+                #    generation strictly behind the head with a matching
+                #    config digest.
+                if restores_generation is not None:
+                    if head is None:
+                        return AdmissionDecision(
+                            False, 409, ERR_RESTORE_TARGET_NOT_FOUND,
+                            f"device {device_id!r} has no accepted generation "
+                            f"{restores_generation} to restore",
+                        )
+                    if restores_generation >= head.generation:
+                        return AdmissionDecision(
+                            False, 409, ERR_RESTORE_TARGET_NOT_EARLIER,
+                            f"restoresGeneration {restores_generation} is not "
+                            f"earlier than the current head generation "
+                            f"{head.generation}",
+                        )
+                    target = self.store.find(conn, device_id, restores_generation)
+                    if target is None:
+                        return AdmissionDecision(
+                            False, 409, ERR_RESTORE_TARGET_NOT_FOUND,
+                            f"device {device_id!r} has no accepted generation "
+                            f"{restores_generation} to restore",
+                        )
+                    if target.config_sha256 != config_sha256:
+                        return AdmissionDecision(
+                            False, 409, ERR_RESTORE_CONFIG_MISMATCH,
+                            f"configSha256 does not match the digest accepted "
+                            f"at generation {restores_generation}",
+                        )
+
                 self.store.insert(
                     conn,
                     device_id=device_id,
@@ -269,6 +329,7 @@ class Admitter:
                     attestation_id=attestation_id,
                     payload_sha256=payload_sha,
                     accepted_at=_now(),
+                    restores_generation=restores_generation,
                 )
                 rec = self.store.find(conn, device_id, generation)
                 return AdmissionDecision(
